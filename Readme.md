@@ -19,7 +19,7 @@ pip install pandas
 
 ## It has a very simple layout: 
 
-```json
+```
 
 data : has all the necessary input and output files 
 main_scaper.py: you run this file to generate the necessary information of companies
