@@ -3,16 +3,30 @@ import requests
 import pandas as pd
 import time
 import re
+from difflib import SequenceMatcher
+
 
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 # Load the data
-df = pd.read_csv("data/clothes_data.csv")
-df_sample = df[:5]
+df = pd.read_csv("data/missing_input.csv", dtype=str)
+df_sample = df[:300]
 print(df.head())
 
-#phone validation
+#address validation 
+def address_similarity(addr1, addr2):
+    """Return similarity ratio between two addresses (0 to 1)."""
+    return SequenceMatcher(None, addr1.lower(), addr2.lower()).ratio()
+
+def extract_postal(address):
+    """Extract 6-digit Singapore postal code if present"""
+    match = re.search(r'S(\d{6})|\b(\d{6})\b', address)
+    if match:
+        return match.group(1) or match.group(2)
+    return None
+
+#phone validation for singapore numbers
 def is_valid_singapore_phone(number: str) -> bool:
     """Check if number is valid Singapore phone format"""
     cleaned = re.sub(r'[\s\-\(\)]', '', number)
@@ -20,15 +34,14 @@ def is_valid_singapore_phone(number: str) -> bool:
     elif cleaned.startswith('65'): cleaned = cleaned[2:]
     return len(cleaned) == 8 and cleaned.isdigit() and cleaned[0] in '689'
 
-#any international numbers
-
+#any international numbers - put it in extra phone numbers 
 def extract_extra_numbers(all_text, primary):
     """
     Extract any additional numbers that start with '+'.
     Keeps them if they are different from the primary number.
     """
     # Match anything starting with + and at least 7 digits after
-    numbers = re.findall(r'\+\d[\d\s\-()]{6,}', all_text)
+    numbers = re.findall(r'\+\d{1,3}[\s\-()]?\d{6,12}', all_text)
 
     cleaned_numbers = []
     for num in numbers:
@@ -38,7 +51,7 @@ def extract_extra_numbers(all_text, primary):
 
     return ", ".join(set(cleaned_numbers)) if cleaned_numbers else "Not found"
 
-
+#check if its like a business registration number or UEN
 def is_registration_number(number: str, context: str) -> bool:
     """Check if number is likely a business registration/UEN"""
     cleaned = re.sub(r'[\s\-]', '', number)
@@ -49,6 +62,7 @@ def is_registration_number(number: str, context: str) -> bool:
         return any(keyword in context.lower() for keyword in business_keywords)
     return False
 
+#then extract the right phone number based on the above criteria 
 def extract_right_phone_number(search_results:dict) -> str:
     """Extract the most probable phone number from candidates"""
     kg_phone = search_results.get("knowledgeGraph", {}).get("phone")
@@ -87,7 +101,7 @@ def extract_right_phone_number(search_results:dict) -> str:
     return "Not found"
 
 
-
+#this does the google search using the API KEY
 def google_search(query):
     url = "https://google.serper.dev/search"
     headers = {
@@ -102,10 +116,10 @@ def google_search(query):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        print(f"Search error for {q}: {e}")
+        print(f"Search error for {query}: {e}")
         return {}
 
-
+# then extract the info from google search 
 def extract_info_without_ai(search_results):
     """Extract information directly from search results without using AI"""
     info = {
@@ -211,7 +225,7 @@ def extract_info_without_ai(search_results):
     
     return info
 
-
+# Fallback extraction method without AI
 def extract_company_info_fallback(company, search_results):
     """Fallback method without AI - direct extraction from search results"""
     
@@ -227,9 +241,10 @@ def extract_company_info_fallback(company, search_results):
     
     return info
 
-
+# Wrapper to handle retries (if needed), rn set to 0 because most of the time it works fine
+# right now only google search, can implemenet AI extraction if needed
 def extract_company_info_with_retry(company, search_results, max_retries=0):
-    """Extract company info without Gemini, fallback only"""
+    """Extract company info without AI, fallback only"""
     return extract_company_info_fallback(company, search_results)
 
 
@@ -237,7 +252,7 @@ def extract_company_info_with_retry(company, search_results, max_retries=0):
 results = []
 for i, (_, row) in enumerate(df_sample.iterrows()):
     company = row['entity_name']
-    print(f"\nProcessing {i+1}/whole: {company}")
+    print(f"\nProcessing {i+1}/{len(df_sample)}: {company}")
     
     # Search for company
     search_results = google_search(company)
@@ -245,7 +260,7 @@ for i, (_, row) in enumerate(df_sample.iterrows()):
     if not search_results.get('organic') and not search_results.get('knowledgeGraph'):
         print(f"  No search results found for {company}")
         results.append({
-            "company_name": {company},
+            "company_name": company,
             "website_link": "Not found",
             "address": "Not found", 
             "phone_number": "Not found",
@@ -257,7 +272,45 @@ for i, (_, row) in enumerate(df_sample.iterrows()):
     
     # Extract company info
     company_info = extract_company_info_with_retry(company, search_results)
-    print(f"  Result: {company_info.get('website_link', 'Not found')}")
+
+    #cross-check address with available adddress
+    csv_address = str(row.get('address', '')).strip()
+    csv_postal = str(row.get('postal_code', '')).strip()
+    extracted_address = str(company_info.get('address', '')).strip()
+    validation_passed = "Unknown"
+
+    if csv_address and extracted_address and extracted_address != "Not found":
+        sim_ratio = address_similarity(csv_address, extracted_address)
+        postal_csv = csv_postal  
+        postal_extracted = extract_postal(extracted_address)
+
+        if postal_csv and postal_extracted and postal_csv == postal_extracted:
+            validation_passed = "Postal match"
+        elif sim_ratio > 0.7:
+            print("  Address similarity high enough.")
+            validation_passed = f"Similarity {sim_ratio:.2f}"    
+        else:
+            print("address mismatch, retry with csv address")
+            validation_passed = f"Similarity {sim_ratio:.2f}"
+            refined_results = google_search(f"{company} {csv_address}")
+            refined_info = extract_company_info_with_retry(company, refined_results)
+            refined_address = refined_info.get("address", "Not found")
+
+            if refined_address != "Not found":
+                sim2 = address_similarity(csv_address, refined_address)
+                postal2 = extract_postal(refined_address)
+                if (postal2 and postal_csv and postal2 == postal_csv) or sim2 > 0.7:
+                    print("  Revalidated with refined search.")
+                    company_info = refined_info
+                    validation_passed = "Revalidated"
+                else:
+                    company_info["address"] = csv_address
+                    validation_passed = "Forced CSV fallback"
+            else:
+                company_info["address"] = csv_address
+                validation_passed = "CSV fallback"
+            
+    company_info["validation_passed"] = validation_passed
     results.append(company_info)
     
     # Add delay to avoid rate limiting
@@ -265,8 +318,8 @@ for i, (_, row) in enumerate(df_sample.iterrows()):
 
 # Save results
 df_results = pd.DataFrame(results)
-df_results.to_csv("data/clothes_phone.csv", index=False)
-print(f"\n✓ Success - Results saved")
+df_results.to_csv("data/filled_output.csv", index=False)
+print(f"\n✓ Success - Results saved to your desired path")
 print(f"Found info for {len([r for r in results if r['website_link'] != 'Not found'])} companies")
 
 
